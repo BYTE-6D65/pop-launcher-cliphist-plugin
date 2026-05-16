@@ -1,24 +1,12 @@
 [package]
 name = "cliphist"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
-blocking = "1.6.2"
-futures = "0.3.31"
-pop-launcher = { git = "https://bgithub.xyz/pop-os/launcher" }
-serde_json = "1.0.140"
-tokio = { version = "1.44.2", features = [
-    "rt",
-    "macros",
-    "rt-multi-thread",
-    "process",
-    "io-std",
-    "io-util",
-    "time",
-] }
-tracing = "0.1.40"
-fuzzy-matcher = "*"
+fuzzy-matcher = "0.3"
+pop-launcher-toolkit = { git = "https://github.com/pop-os/launcher" }
+tokio = { version = "1", features = ["rt", "macros", "process", "io-std"] }
 
 [profile.release]
 codegen-units = 1

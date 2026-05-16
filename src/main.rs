@@ -1,123 +1,153 @@
-use futures::prelude::*;
-use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
-use pop_launcher::PluginResponse;
-use pop_launcher::*;
-use std::{borrow::Cow, cmp::Ordering, collections::HashMap, process::Command};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+// Cliphist plugin for pop-launcher (COSMIC launcher).
+//
+// KNOWN QUIRK: pop-launcher sends different queries for `!` vs `! ` (bang alone
+// vs bang+space). The no-query sort order differs from the with-query sort order
+// and we never figured out why -- pop-launcher appears to apply its own secondary
+// ranking that we can't control. The with-query (`! `) path sorts correctly by
+// recency. The no-query (`!`) path is "close enough." This is stupid and we'll
+// revisit it when someone cares enough to debug pop-launcher's internal sort.
+//   -- Byte & Annie, May 2026
 
-pub async fn send<W: AsyncWrite + Unpin>(tx: &mut W, response: PluginResponse) {
-    if let Ok(mut bytes) = serde_json::to_string(&response) {
-        bytes.push('\n');
-        let _ = tx.write_all(bytes.as_bytes()).await;
-    }
+use fuzzy_matcher::FuzzyMatcher;
+use pop_launcher_toolkit::launcher::{Indice, PluginResponse, PluginSearchResult};
+use pop_launcher_toolkit::plugin_trait::{async_trait, PluginExt};
+use std::process::Stdio;
+use tokio::process::Command;
+
+struct Entry {
+    cliphist_id: String,
+    content: String,
 }
 
-/// Run both futures and take the output of the first one to finish.
-pub async fn or<T>(future1: impl Future<Output = T>, future2: impl Future<Output = T>) -> T {
-    futures::pin_mut!(future1);
-    futures::pin_mut!(future2);
-
-    futures::future::select(future1, future2)
-        .await
-        .factor_first()
-        .0
+struct CliphistPlugin {
+    entries: Vec<Entry>,
 }
 
-/// Fetch the mime for a given path
-
-pub struct App {
-    recent: Option<Vec<String>>,
-    out: tokio::io::Stdout,
-    matcher: SkimMatcherV2,
-    iris: Vec<String>,
-}
-
-impl Default for App {
-    fn default() -> Self {
-        Self {
-            recent: None,
-            out: async_stdout(),
-            matcher: SkimMatcherV2::default(),
-            iris: Vec::new(),
-        }
-    }
-}
-
-#[tokio::main]
-pub async fn main() {
-    let mut requests = json_input_stream(async_stdin());
-    let mut app = App::default();
-    app.recent = Some(init());
-    while let Some(result) = requests.next().await {
-        match result {
-            Ok(request) => match request {
-                Request::Activate(id) => app.activate(id).await,
-                Request::Search(query) => app.search(query).await,
-                // Request::Context(id) => app.activate(id).await,
-                Request::Exit => break,
-                _ => (),
-            },
-            Err(why) => {
-                tracing::error!("malformed JSON input: {}", why);
-            }
-        }
-    }
-}
-
-impl App {
-    async fn activate(&mut self, id: u32) {
-        let selected = &self.iris[id as usize];
-        let fid: u32 = selected.split_once("	").unwrap().0.parse().unwrap();
-        Command::new("/usr/bin/sh")
-            .arg("-c")
-            .arg(format!("cliphist decode {fid} | wl-copy"))
-            .spawn()
-            .unwrap();
-        crate::send(&mut self.out, PluginResponse::Close).await;
+#[async_trait]
+impl PluginExt for CliphistPlugin {
+    fn name(&self) -> &str {
+        "cliphist"
     }
 
-    async fn search(&mut self, query: String) {
-        self.iris.clear();
-        if let Some((recent, query)) = self.recent.as_mut().zip(normalized(&query)) {
-            let mut recent: Vec<(Option<i64>, &String)> = recent
+    async fn search(&mut self, query: &str) {
+        // Refresh entries from cliphist on every search (no stale cache)
+        self.entries = load_entries().await;
+        let total = self.entries.len();
+
+        // Strip the ! prefix that pop-launcher passes through
+        let query = query.strip_prefix('!').unwrap_or(query).trim();
+
+        let results: Vec<(u64, usize)> = if query.is_empty() {
+            // No query: return all, scored by recency (exponential decay).
+            // See top-of-file comment about why this doesn't always sort right.
+            self.entries
                 .iter()
-                .map(|i| (self.matcher.fuzzy_match(i, query.trim()), i))
-                .collect();
-            recent.sort_by_key(|a| a.0);
-            for (score, item) in recent.iter().rev() {
-                self.iris.push(item.to_owned().to_owned());
-                if score.is_some() {
-                    let item = item.replace("	", " ");
-                    crate::send(
-                        &mut self.out,
-                        PluginResponse::Append(PluginSearchResult {
-                            id: self.iris.len() as u32 - 1,
-                            name: item.to_owned(),
-                            // description: self.matcher.fuzzy_match(&item, &query).unwrap().to_string(),
-                            icon: Some(IconSource::Mime(Cow::Owned("weather-clear".to_string()))),
-                            ..Default::default()
-                        }),
-                    )
-                    .await;
-                }
-            }
+                .enumerate()
+                .map(|(i, _)| {
+                    let score = if total > i { ((total - i) as u64).pow(2) } else { 0 };
+                    (score, i)
+                })
+                .collect()
+        } else {
+            // Fuzzy search: blend match quality with recency
+            let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
+            self.entries
+                .iter()
+                .enumerate()
+                .filter_map(|(i, e)| {
+                    let fuzzy = matcher.fuzzy_match(&e.content, query)? as u64;
+                    let recency = ((total - i) as f64 / total as f64 * 100.0) as u64;
+                    let blended = fuzzy * 8 / 10 + recency * 2 / 10;
+                    Some((blended, i))
+                })
+                .collect()
+        };
+
+        let mut sorted = results;
+        sorted.sort_by(|a, b| b.0.cmp(&a.0));
+
+        for (_, idx) in sorted.iter().take(20) {
+            let entry = &self.entries[*idx];
+            self.respond_with(PluginResponse::Append(PluginSearchResult {
+                id: *idx as Indice,
+                name: entry.content.clone(),
+                description: String::new(),
+                keywords: None,
+                icon: None,
+                exec: None,
+                window: None,
+            }))
+            .await;
         }
-        crate::send(&mut self.out, PluginResponse::Finished).await;
+
+        self.respond_with(PluginResponse::Finished).await;
+    }
+
+    async fn activate(&mut self, id: Indice) {
+        if let Some(entry) = self.entries.get(id as usize) {
+            // Decode cliphist entry back to both clipboards
+            let _ = Command::new("sh")
+                .arg("-c")
+                .arg(format!("cliphist decode {} | wl-copy", entry.cliphist_id))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+
+            let _ = Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "cliphist decode {} | wl-copy --primary",
+                    entry.cliphist_id
+                ))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        }
+
+        self.respond_with(PluginResponse::Close).await;
     }
 }
 
-fn normalized(input: &str) -> Option<String> {
-    input
-        .find(' ')
-        .map(|pos| input[pos + 1..].trim().to_ascii_lowercase())
+async fn load_entries() -> Vec<Entry> {
+    let output = Command::new("cliphist")
+        .arg("list")
+        .output()
+        .await
+        .ok();
+
+    let stdout = match output {
+        Some(o) => o.stdout,
+        None => return Vec::new(),
+    };
+
+    let text = String::from_utf8_lossy(&stdout);
+    let mut entries = Vec::new();
+
+    for line in text.lines() {
+        if let Some((id, content)) = line.split_once('\t') {
+            // First line of content, truncated to 120 chars
+            let clean = content
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect::<String>();
+
+            entries.push(Entry {
+                cliphist_id: id.to_string(),
+                content: clean,
+            });
+        }
+    }
+
+    entries
 }
 
-fn init() -> Vec<String> {
-    let bytes = Command::new("cliphist").arg("list").output().unwrap();
-    // println!("{:?}",bytes.status.success());
-    String::from_utf8(bytes.stdout)
-        .unwrap()
-        .split('\n')
-        .map(|i| i.to_owned())
-        .collect()
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    let mut plugin = CliphistPlugin { entries: Vec::new() };
+    plugin.run().await;
 }
